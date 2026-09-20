@@ -1,0 +1,152 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      APP_DIR: /opt/lookinside  # change if you prefer a different path
+      DOCKER_IMAGE: lookinside/app
+      DOCKER_CONTAINER: lookinside
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Dockerfile exists
+        run: |
+          test -f Dockerfile || (echo "Dockerfile not found" && exit 1)
+
+      - name: Copy repository to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "."
+          target: "${{ env.APP_DIR }}"
+          strip_components: 0
+          overwrite: true
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.1.0
+        env:
+          # Optional: full .env as a single secret (takes precedence if provided)
+          ENV_FILE_CONTENTS: ${{ secrets.ENV_FILE_CONTENTS }}
+
+          # Repo variables (Settings → Variables) - safe to store non-sensitive values
+          ENVIRONMENT: ${{ vars.ENVIRONMENT }}
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_PORT: ${{ vars.SERVER_PORT }}
+          GIN_MODE: ${{ vars.GIN_MODE }}
+          DB_HOST: ${{ vars.DB_HOST }}
+          DB_PORT: ${{ vars.DB_PORT }}
+          DB_NAME: ${{ vars.DB_NAME }}
+          DB_SSLMODE: ${{ vars.DB_SSLMODE }}
+          GOOGLE_REDIRECT_URL: ${{ vars.GOOGLE_REDIRECT_URL }}
+          COOKIE_DOMAIN: ${{ vars.COOKIE_DOMAIN }}
+          TLS_CERT_FILE: ${{ vars.TLS_CERT_FILE }}
+          TLS_KEY_FILE: ${{ vars.TLS_KEY_FILE }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          # Prefer secrets for webhooks (sensitive); fall back to vars if needed
+          DISCORD_NEW_USER_WEBHOOK: ${{ secrets.DISCORD_NEW_USER_WEBHOOK || vars.DISCORD_NEW_USER_WEBHOOK }}
+          DISCORD_REPORT_WEBHOOK: ${{ secrets.DISCORD_REPORT_WEBHOOK || vars.DISCORD_REPORT_WEBHOOK }}
+
+          # Secrets (Settings → Secrets and variables → Actions → Secrets)
+          # Allow fallback to repo variables if secret not set
+          DB_USER: ${{ secrets.DB_USER || vars.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || vars.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET || vars.GOOGLE_CLIENT_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET || vars.JWT_SECRET }}
+          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID || vars.VITE_GOOGLE_CLIENT_ID }}
+
+          # Build metadata
+          GIT_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: GIT_SHA,ENV_FILE_CONTENTS,ENVIRONMENT,SERVER_HOST,SERVER_PORT,GIN_MODE,DB_HOST,DB_PORT,DB_USER,DB_PASSWORD,DB_NAME,DB_SSLMODE,GOOGLE_CLIENT_ID,GOOGLE_CLIENT_SECRET,GOOGLE_REDIRECT_URL,JWT_SECRET,COOKIE_DOMAIN,TLS_CERT_FILE,TLS_KEY_FILE,VITE_API_BASE_URL,VITE_GOOGLE_CLIENT_ID,DISCORD_NEW_USER_WEBHOOK,DISCORD_REPORT_WEBHOOK
+          script: |
+            set -e
+            APP_DIR="${{ env.APP_DIR }}"
+
+            mkdir -p "$APP_DIR"
+            cd "$APP_DIR"
+
+            # Write .env from single secret if provided, otherwise compose from individual Secrets/Vars
+            if [ -n "${ENV_FILE_CONTENTS:-}" ]; then
+              echo "Writing .env from ENV_FILE_CONTENTS secret"
+              printf "%s" "$ENV_FILE_CONTENTS" > .env
+            else
+              echo "Composing .env from repository Variables and Secrets"
+              : > .env
+              append_line() {
+                if [ -n "${2:-}" ]; then
+                  printf "%s=%s\n" "$1" "$2" >> .env
+                fi
+              }
+
+              # Core app settings
+              append_line ENVIRONMENT        "${ENVIRONMENT:-}"
+              append_line SERVER_HOST        "${SERVER_HOST:-}"
+              append_line SERVER_PORT        "${SERVER_PORT:-}"
+              append_line GIN_MODE           "${GIN_MODE:-}"
+
+              # Database connectivity for the app
+              append_line DB_HOST            "${DB_HOST:-db}"
+              append_line DB_PORT            "${DB_PORT:-5432}"
+              append_line DB_USER            "${DB_USER:-}"
+              append_line DB_PASSWORD        "${DB_PASSWORD:-}"
+              append_line DB_NAME            "${DB_NAME:-${POSTGRES_DB:-look_inside}}"
+              append_line DB_SSLMODE         "${DB_SSLMODE:-disable}"
+
+              # OAuth
+              append_line GOOGLE_CLIENT_ID     "${GOOGLE_CLIENT_ID:-}"
+              append_line GOOGLE_CLIENT_SECRET "${GOOGLE_CLIENT_SECRET:-}"
+              append_line GOOGLE_REDIRECT_URL  "${GOOGLE_REDIRECT_URL:-}"
+
+              # Frontend (Vite) public env
+              append_line VITE_API_BASE_URL     "${VITE_API_BASE_URL:-}"
+              append_line VITE_GOOGLE_CLIENT_ID "${VITE_GOOGLE_CLIENT_ID:-}"
+
+              # Auth
+              append_line JWT_SECRET         "${JWT_SECRET:-}"
+              append_line COOKIE_DOMAIN      "${COOKIE_DOMAIN:-}"
+
+              # TLS (optional)
+              append_line TLS_CERT_FILE      "${TLS_CERT_FILE:-/certs/fullchain.pem}"
+              append_line TLS_KEY_FILE       "${TLS_KEY_FILE:-/certs/privkey.pem}"
+
+              # Notifications / Webhooks
+              append_line DISCORD_NEW_USER_WEBHOOK "${DISCORD_NEW_USER_WEBHOOK:-}"
+              append_line DISCORD_REPORT_WEBHOOK   "${DISCORD_REPORT_WEBHOOK:-}"
+
+              echo ".env keys written:"
+              awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/{print " - " $1}' .env || true
+            fi
+
+            # Ensure Docker and docker compose are available
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "Docker not found on server"; exit 1
+            fi
+            docker version
+            docker compose version || { echo "docker compose v2 is required"; exit 1; }
+
+            # Bring up the stack (build images, create network/volumes, start services)
+            echo "Starting stack with docker compose..."
+            docker compose down
+            docker compose up -d --build
+
+            docker system prune -f || true
+            echo "Deployment complete."

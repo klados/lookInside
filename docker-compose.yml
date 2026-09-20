@@ -1,0 +1,145 @@
+version: "3.9"
+
+services:
+
+  report-tool:
+    container_name: app-report-tool
+    build:
+      context: .
+      # 1. Use the correct Dockerfile for the report tool
+      dockerfile: Dockerfile.report-tool
+    # 2. Use the correct executable path and wrap it in a loop
+    command: sh -c "while true; do /app/report-tool; echo 'sleeping for 24h'; sleep 86400; done"
+    environment:
+      GIN_MODE: ${GIN_MODE:-release}
+      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: "443"
+      # Database connectivity: force service name to avoid localhost fallback
+      DB_HOST: "db"
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
+      # TLS (main.go will enable HTTPS when these are set)
+      TLS_CERT_FILE: "/certs/fullchain.pem"
+      TLS_KEY_FILE: "/certs/privkey.pem"
+      # REQUIRED to let the app start (previously missing)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      JWT_SECRET: ${JWT_SECRET}
+      # Optional but commonly needed
+      GOOGLE_REDIRECT_URL: ${GOOGLE_REDIRECT_URL}
+      ENVIRONMENT: ${ENVIRONMENT:-prod}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      # Redis connectivity
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # The app requires a discord webhook to send the report
+      DISCORD_REPORT_WEBHOOK: ${DISCORD_REPORT_WEBHOOK}
+      DISCORD_NEW_USER_WEBHOOK: ${DISCORD_NEW_USER_WEBHOOK}
+    restart: "no" # 'unless-stopped' might be better if you want it to survive restarts
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: app-db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    command: [ "postgres", "-c", "shared_preload_libraries=timescaledb" ]
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: app-redis
+    env_file:
+      - .env
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: [ "redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}" ]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
+        VITE_GOOGLE_CLIENT_ID: ${VITE_GOOGLE_CLIENT_ID}
+    container_name: app-backend
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Run as root so the process can read Let's Encrypt cert files (which are root:root, 600)
+    user: "0:0"
+    # Removed env_file to avoid empty keys overriding environment block
+    # env_file:
+    #   - .env
+    environment:
+      # Go server
+      GIN_MODE: ${GIN_MODE:-release}
+      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: "443"
+      # Database connectivity: force service name to avoid localhost fallback
+      DB_HOST: "db"
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
+      # TLS (main.go will enable HTTPS when these are set)
+      TLS_CERT_FILE: "/certs/fullchain.pem"
+      TLS_KEY_FILE: "/certs/privkey.pem"
+      # REQUIRED to let the app start (previously missing)
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      JWT_SECRET: ${JWT_SECRET}
+      # Optional but commonly needed
+      GOOGLE_REDIRECT_URL: ${GOOGLE_REDIRECT_URL}
+      ENVIRONMENT: ${ENVIRONMENT:-prod}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-}
+      # Redis connectivity
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports:
+      - "443:443"
+    volumes:
+      - /etc/letsencrypt/live/lookins1de.online/fullchain.pem:/certs/fullchain.pem:ro
+      - /etc/letsencrypt/live/lookins1de.online/privkey.pem:/certs/privkey.pem:ro
+    healthcheck:
+      # Use curl and skip cert verification for localhost, or replace with your public domain
+      test: ["CMD-SHELL", "apk add --no-cache curl >/dev/null 2>&1 || true; curl -sk https://localhost:443/ -o /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  redis-data:

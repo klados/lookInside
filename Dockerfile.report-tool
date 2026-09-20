@@ -1,0 +1,32 @@
+# Go build stage
+FROM golang:1.24-alpine AS go-builder
+WORKDIR /app
+RUN apk add --no-cache build-base git
+
+# Go deps cache
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy full source (excluding what .dockerignore filters out)
+COPY . ./
+
+# Build the report tool binary
+ENV CGO_ENABLED=0 GOOS=linux
+RUN go build -ldflags="-s -w" -o /app/report-tool ./cmd/report-tool
+
+# Runtime stage (minimal)
+FROM alpine:3.20
+WORKDIR /app
+RUN addgroup -S app && adduser -S app -G app \
+  && apk add --no-cache ca-certificates tzdata
+
+# Copy binary
+COPY --from=go-builder /app/report-tool /app/report-tool
+
+# Set proper permissions
+RUN chmod +x /app/report-tool
+
+USER app
+
+# Default command runs the report tool
+CMD ["/app/report-tool"]
